@@ -1,12 +1,12 @@
 BIN = ministat 
-SRCS= ministat.c
-OBJS= ministat.o
+SRCS= ministat.c mergesort.c
+OBJS= ministat.o mergesort.o
 
 PKGS = 
 
-CFLAGS  += -g -Wall -Werror
+CFLAGS  += -g -Wall -Werror -ggdb -O2 
 CPPFLAGS+= -I. -D_GNU_SOURCE
-LDFLAGS += -lm
+LDFLAGS += -lm -pthread
 
 PREFIX ?= /usr
 

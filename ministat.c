@@ -1,3 +1,4 @@
+
 /*
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
@@ -5,21 +6,27 @@
  * can do whatever you want with this stuff. If we meet some day, and you think
  * this stuff is worth it, you can buy me a beer in return.   Poul-Henning Kamp
  * ----------------------------------------------------------------------------
- *
+ *--------------Nov-12-2020----------
  */
 #include <sys/ioctl.h>
-
 #include <err.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include "queue.h"
+#include "dtoa-fast/dtoa/strtod-lite.c"
 
 #define NSTUDENT 100
 #define NCONF 6
+
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER; 
 double const studentpct[] = { 80, 90, 95, 98, 99, 99.5 };
 double student [NSTUDENT + 1][NCONF] = {
 /* inf */	{	1.282,	1.645,	1.960,	2.326,	2.576,	3.090  },
@@ -127,7 +134,8 @@ double student [NSTUDENT + 1][NCONF] = {
 
 #define	MAX_DS	8
 static char symbol[MAX_DS] = { ' ', 'x', '+', '*', '%', '#', '@', 'O' };
-
+static unsigned long long int ti[2];
+struct timespec start, stop;
 struct dataset {
 	char *name;
 	double	*points;
@@ -135,10 +143,32 @@ struct dataset {
 	double sy, syy;
 	unsigned n;
 };
+int countedAddPoint = 0;
+int multithreaded_mergsesort(double *a_arr, unsigned int n, double * b_result);
+
+//input for ReadSet Thread 
+struct input{
+	char * file;
+	float flag_v;
+	struct dataset * s; 
+};
+
+struct node{
+	double data; 
+	struct node * next;
+};
+
+//input for read loop thread 
+struct read_arg{
+	char * file;
+	int seek_start; 
+	int bytes_to_read; 
+	struct dataset * s; 
+};
 
 static struct dataset *
 NewSet(void)
-{
+{ 
 	struct dataset *ds;
 
 	ds = calloc(1, sizeof *ds);
@@ -150,18 +180,32 @@ NewSet(void)
 static void
 AddPoint(struct dataset *ds, double a)
 {
-	double *dp;
-
+	double *temp;
+	
 	if (ds->n >= ds->lpoints) {
-		dp = ds->points;
 		ds->lpoints *= 4;
-		ds->points = calloc(sizeof *ds->points, ds->lpoints);
-		memcpy(ds->points, dp, sizeof *dp * ds->n);
-		free(dp);
+		temp = realloc(ds->points, (ds->lpoints * sizeof *ds->points));
+		if (temp == NULL) {
+			printf("Realloc failed in AddPoint. Exiting...\n");
+			exit(0);
+		} else {
+			ds->points = temp;
+		}
 	}
 	ds->points[ds->n++] = a;
 	ds->sy += a;
 	ds->syy += a * a;
+}
+
+static void 
+Append(struct dataset *s1, struct dataset *s2)
+{
+	s1->points = realloc(s1->points, sizeof s1->points + (s2->lpoints * sizeof s2->points));
+	memcpy(s1->points + s1->n, s2->points , s2->n * sizeof s2->points);
+	s1->lpoints += s2->lpoints;
+	s1->sy += s2->sy;
+	s1->syy += s2->syy;
+	s1->n += s2->n;
 }
 
 static double
@@ -204,6 +248,13 @@ Stddev(struct dataset *ds)
 {
 
 	return sqrt(Var(ds));
+}
+
+static void 
+TimePrint(void)
+{
+	printf("Timing Performance 		AddPoint 	ReadSet		 	\n");
+	printf("Today:             		 %llu s            %llu s\n", ti[0], ti[1]);
 }
 
 static void
@@ -253,7 +304,7 @@ Relative(struct dataset *ds, struct dataset *rs, int confidx)
 }
 
 struct plot {
-	double		min;
+	double		Min;
 	double		max;
 	double		span;
 	int		width;
@@ -280,7 +331,7 @@ SetupPlot(int width, int separate, int num_datasets)
 	pl->bar = NULL;
 	pl->separate_bars = separate;
 	pl->num_datasets = num_datasets;
-	pl->min = 999e99;
+	pl->Min = 999e99;
 	pl->max = -999e99;
 }
 
@@ -290,13 +341,13 @@ AdjPlot(double a)
 	struct plot *pl;
 
 	pl = &plot;
-	if (a < pl->min)
-		pl->min = a;
+	if (a < pl->Min)
+		pl->Min = a;
 	if (a > pl->max)
 		pl->max = a;
-	pl->span = pl->max - pl->min;
+	pl->span = pl->max - pl->Min;
 	pl->dx = pl->span / (pl->width - 1.0);
-	pl->x0 = pl->min - .5 * pl->dx;
+	pl->x0 = pl->Min - .5 * pl->dx;
 }
 
 static void
@@ -436,67 +487,226 @@ dbl_cmp(const void *a, const void *b)
 	const double *aa = a;
 	const double *bb = b;
 
-	if (*aa < *bb)
-		return (-1);
-	else if (*aa > *bb)
-		return (1);
-	else
-		return (0);
+ 	if (*aa < *bb)
+ 		return (-1);
+ 	else if (*aa > *bb)
+ 		return (1);
+ 	else
+ 		return (0);
 }
 
-static struct dataset *
-ReadSet(const char *n, int column, const char *delim)
-{
-	FILE *f;
-	char buf[BUFSIZ], *p, *t;
-	struct dataset *s;
-	double d;
-	int line;
-	int i;
+#define AN_QSORT_SUFFIX doubles
+#define AN_QSORT_TYPE double
+#define AN_QSORT_CMP dbl_cmp
 
-	if (n == NULL) {
-		f = stdin;
-		n = "<stdin>";
-	} else if (!strcmp(n, "-")) {
-		f = stdin;
-		n = "<stdin>";
-	} else {
-		f = fopen(n, "r");
-	}
-	if (f == NULL)
-		err(1, "Cannot open %s", n);
+#include "an_qsort.inc"
+
+void * 
+read_loop(void * argument)
+{
+	struct read_arg * args = (struct read_arg *) argument; 
+	char * n = args -> file; 
+	int seek_start = args -> seek_start;
+	int bytes_to_read = args -> bytes_to_read; 
+	struct dataset * s = args -> s;
 	s = NewSet();
 	s->name = strdup(n);
-	line = 0;
-	while (fgets(buf, sizeof buf, f) != NULL) {
-		line++;
 
-		i = strlen(buf);
-		if (buf[i-1] == '\n')
-			buf[i-1] = '\0';
-		for (i = 1, t = strtok(buf, delim);
-		     t != NULL && *t != '#';
-		     i++, t = strtok(NULL, delim)) {
-			if (i == column)
-				break;
-		}
-		if (t == NULL || *t == '#')
-			continue;
+	char buf[BUFSIZ], truncat[BUFSIZ], *t, *cursor;
+	double d;
+	int f, bytes_read_sofar, r;
+	int overflow = 0;
+    int prev_overflow = 0; 
+	size_t num;
+	char *p;
+	int read_size = 8000;
+	int total_bytes_read = 0;
 
-		d = strtod(t, &p);
-		if (p != NULL && *p != '\0')
-			err(2, "Invalid data on line %d in %s\n", line, n);
-		if (*buf != '\0')
-			AddPoint(s, d);
+	if (n == NULL) {
+		f = STDIN_FILENO;
+		n = "<stdin>";
+	} else if (!strcmp(n, "-")) {
+		f = STDIN_FILENO;
+		n = "<stdin>";
+	} else {
+		f = open(n, O_RDWR);
 	}
-	fclose(f);
+	if (f == -1)
+		err(1, "Cannot open %s", n);
+	
+	// move to appropriate section
+	lseek(f, seek_start, SEEK_SET);
+
+	while (total_bytes_read < bytes_to_read) {	
+		//checking read buffer size
+        if(read_size > (bytes_to_read - total_bytes_read)){
+			read_size = (bytes_to_read - total_bytes_read) + 1;
+		}
+
+		r = read(f, buf, read_size - 1);
+		total_bytes_read += r; 
+		buf[read_size] = '\0';
+        bytes_read_sofar = 0; 
+        cursor = strdup(buf); 
+
+		// check for truncation 
+		if(prev_overflow == 1) {
+			num = strcspn(cursor, "\n \t"); 
+			bytes_read_sofar += num;
+			t = strsep(&cursor, "\n \t");
+			strcat(truncat, t);
+			d = strtod_fast(truncat, &p);
+			AddPoint(s, d);
+			prev_overflow = 0;
+		}
+
+		// check for overflow 
+		if(buf[r-1] != '\n' && buf[r-1] != '\0' && buf[r-1] != ' ' && buf[r-1] != '\t'){
+			overflow = 1; 
+		}
+
+		for(;;){
+			if (cursor != NULL) {
+				num = strcspn(cursor, "\n \t"); 
+				bytes_read_sofar += num + 1;
+			}
+                                        
+			t = strsep(&cursor, "\n \t");
+			if(t == NULL){
+				break;
+			} else if(*t != '\0'){
+				if((overflow == 1) && (bytes_read_sofar >= r)){
+					strcpy(truncat,t);
+					overflow = 0; 
+					prev_overflow = 1; 
+				}
+				else{
+					d = strtod_fast(t, &p);
+					AddPoint(s, d);
+				}
+			}
+		} 
+	    memset(buf, 0, read_size);
+	}
+	close(f);
+
+	//return link list 
+	args -> s = s;
+	
+	return NULL; 
+}
+
+void *
+// old parameters: const char *n, int column, const char *delim, float flag_v
+ReadSet(void * argument)
+{
+	struct input * inputs = (struct input *)argument;
+	char * n = inputs -> file;
+	float flag_v = inputs -> flag_v; 
+	struct dataset *s;
+	double half_size;
+
+	s = NewSet();
+	//s->name = strdup(n);
+
+	if (flag_v) {
+	  clock_gettime(CLOCK_MONOTONIC, &start);
+	}
+
+	// determine how much bytes each thread reads from a file 
+	struct stat buffer;
+    double size;
+    int status, f, r;
+    int thread1_readsize, thread2_readsize;
+	char buf[BUFSIZ]; 
+	int extra_read = 0;
+
+	// return the size of file being read in bytes
+    status = stat(n, &buffer);
+		if(status == 0)
+			size = buffer.st_size;
+		else{
+			size = 0;
+		}
+
+	// split bytes to read by n threads 
+	half_size = size / 2;
+	thread1_readsize = floor(half_size);
+	thread2_readsize = ceil(half_size);
+
+	if (n == NULL) {
+		f = STDIN_FILENO;
+		n = "<stdin>";
+	} else if (!strcmp(n, "-")) {
+		f = STDIN_FILENO;
+		n = "<stdin>";
+	} else {
+		f = open(n, O_RDWR);
+	}
+	if (f == -1)
+		err(1, "Cannot open %s", n);
+
+	lseek(f, thread1_readsize, SEEK_SET);
+
+	// detect truncation from splitting the file
+	r = read(f, buf, 1); // check next byte
+	while(buf[0] != '\n' && buf[0] != '\0' && buf[0] != ' ' && buf[0] != '\t'){
+		r = read(f, buf, 1); // read 1 byte at a time
+		extra_read += r;
+	}
+	
+	memset(buf, 0, BUFSIZ);
+	thread1_readsize += extra_read + 1;
+	thread2_readsize = size - thread1_readsize;  
+	close(f);
+
+	//multithread read: creates 2 thread per file 
+	size_t THREAD_READ = 2;
+	pthread_t thread[THREAD_READ]; 
+	struct read_arg args[THREAD_READ];
+	for(int i = 0; i < THREAD_READ; i++){
+		if(i == 0){
+			args[i].seek_start = 0;
+			args[i].bytes_to_read = thread1_readsize;
+		}
+		else{
+			args[i].seek_start = thread1_readsize;
+			args[i].bytes_to_read = thread2_readsize;
+		}
+		args[i].file = n;
+		pthread_create(&thread[i], NULL, &read_loop, (void *)&args[i]);
+	}
+	for(int i = 0; i < THREAD_READ; i++){
+		pthread_join(thread[i], NULL);
+	}
+
+	s = args[0].s;
+	Append(s, args[1].s);
+	//s = args[0].s;
+
 	if (s->n < 3) {
 		fprintf(stderr,
 		    "Dataset %s must contain at least 3 data points\n", n);
 		exit (2);
 	}
-	qsort(s->points, s->n, sizeof *s->points, dbl_cmp);
-	return (s);
+	if (flag_v) {
+	  clock_gettime(CLOCK_MONOTONIC, &stop);
+	  ti[1] = stop.tv_sec - start.tv_sec;
+	}
+
+	an_qsort_doubles(s->points, s->n);
+	/* attempted multithread sorting but an_qsort is still slightly faster
+	double *sort_result = malloc(sizeof(double) * s->n);
+	if (sort_result == NULL) {
+		fprintf(stderr,
+		    "Could not allocate sort result.\n");
+		exit (1);
+	}
+	multithreaded_mergsesort(s->points, s->n, sort_result);
+	s->points = sort_result;
+	*/
+	inputs->s = s;
+	return NULL; 
 }
 
 static void
@@ -506,7 +716,7 @@ usage(char const *whine)
 
 	fprintf(stderr, "%s\n", whine);
 	fprintf(stderr,
-	    "Usage: ministat [-C column] [-c confidence] [-d delimiter(s)] [-ns] [-w width] [file [file ...]]\n");
+	    "Usage: Ministat [-C column] [-c confidence] [-d delimiter(s)] [-ns] [-w width] [file [file ...]]\n");
 	fprintf(stderr, "\tconfidence = {");
 	for (i = 0; i < NCONF; i++) {
 		fprintf(stderr, "%s%g%%",
@@ -519,7 +729,7 @@ usage(char const *whine)
 	fprintf(stderr, "\t-n : print summary statistics only, no graph/test\n");
 	fprintf(stderr, "\t-q : print summary statistics and test only, no graph\n");
 	fprintf(stderr, "\t-s : print avg/median/stddev bars on separate lines\n");
-	fprintf(stderr, "\t-w : width of graph/test output (default 74 or terminal width)\n");
+	fprintf(stderr, "\t-w : width of graph/test output (default 74 or terMinal width)\n");
 	exit (2);
 }
 
@@ -529,14 +739,15 @@ main(int argc, char **argv)
 	struct dataset *ds[7];
 	int nds;
 	double a;
-	const char *delim = " \t";
+	//const char *delim = " \t";
 	char *p;
 	int c, i, ci;
 	int column = 1;
 	int flag_s = 0;
 	int flag_n = 0;
 	int flag_q = 0;
-	int termwidth = 74;
+	int flag_v = 0;
+	int termwidth = 74; 
 
 	if (isatty(STDOUT_FILENO)) {
 		struct winsize wsz;
@@ -549,7 +760,7 @@ main(int argc, char **argv)
 	}
 
 	ci = -1;
-	while ((c = getopt(argc, argv, "C:c:d:snqw:")) != -1)
+	while ((c = getopt(argc, argv, "C:c:d:svnqw:")) != -1)
 		switch (c) {
 		case 'C':
 			column = strtol(optarg, &p, 10);
@@ -559,7 +770,8 @@ main(int argc, char **argv)
 				usage("Column number should be positive.");
 			break;
 		case 'c':
-			a = strtod(optarg, &p);
+			//a = strtod(optarg, &p);
+			a = strtod_fast(optarg, &p);
 			if (p != NULL && *p != '\0')
 				usage("Not a floating point number");
 			for (i = 0; i < NCONF; i++)
@@ -571,13 +783,16 @@ main(int argc, char **argv)
 		case 'd':
 			if (*optarg == '\0')
 				usage("Can't use empty delimiter string");
-			delim = optarg;
+			//delim = optarg;
 			break;
 		case 'n':
 			flag_n = 1;
 			break;
 		case 'q':
 			flag_q = 1;
+			break;
+		case 'v':
+			flag_v = 1;
 			break;
 		case 's':
 			flag_s = 1;
@@ -598,15 +813,29 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
+	pthread_t thread[argc]; 
 	if (argc == 0) {
-		ds[0] = ReadSet("-", column, delim);
+		struct input inputs;
+		inputs.file = "-";
+		inputs.flag_v = flag_v;
+		pthread_create(&thread[0], NULL, &ReadSet, (void*)&inputs);
+		pthread_join(thread[0], NULL);
+		ds[0] = inputs.s;
 		nds = 1;
 	} else {
 		if (argc > (MAX_DS - 1))
 			usage("Too many datasets.");
 		nds = argc;
-		for (i = 0; i < nds; i++)
-			ds[i] = ReadSet(argv[i], column, delim);
+		struct input inputs[argc];
+		for (i = 0; i < nds; i++){
+			inputs[i].flag_v = flag_v;
+			inputs[i].file = argv[i];
+			pthread_create(&thread[i], NULL, &ReadSet, (void*)&inputs[i]);
+		}
+		for(i = 0; i < nds; i++){
+			pthread_join(thread[i], NULL); 
+			ds[i] = inputs[i].s; 
+		}	
 	}
 
 	for (i = 0; i < nds; i++) 
@@ -620,12 +849,17 @@ main(int argc, char **argv)
 			PlotSet(ds[i], i + 1);
 		DumpPlot();
 	}
+
 	VitalsHead();
 	Vitals(ds[0], 1);
 	for (i = 1; i < nds; i++) {
 		Vitals(ds[i], i + 1);
 		if (!flag_n)
 			Relative(ds[i], ds[0], ci);
+	}
+	
+	if (flag_v){
+		TimePrint();
 	}
 	exit(0);
 }
